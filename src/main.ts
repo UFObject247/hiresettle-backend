@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger, RequestMethod } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import * as express from 'express';
+import * as compression from 'compression';
 import { ConfigService } from '@nestjs/config';
 import helmet from 'helmet';
 import * as Sentry from '@sentry/node';
@@ -13,6 +14,7 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
 import { TooManyRequestsHeadersFilter } from './common/filters/too-many-requests-headers.filter';
 import { TracingInterceptor } from './common/interceptors/tracing.interceptor';
 import { assertSecureJwtSecret } from './common/utils/jwt-secret.util';
+import { assertMainnetConfig } from './config/mainnet-guard';
 import { JwtService } from '@nestjs/jwt';
 import { HttpMetricsInterceptor } from './metrics/http-metrics.interceptor';
 import { MetricsService } from './metrics/metrics.service';
@@ -20,6 +22,22 @@ import { MetricsService } from './metrics/metrics.service';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
   app.use('/webhooks/billing', express.raw({ type: 'application/json' }));
+
+  // Enable gzip/brotli response compression for large JSON responses (#514).
+  // SSE streams (text/event-stream) are excluded to avoid buffering issues.
+  app.use(
+    compression({
+      // Only compress responses larger than 1 KB.
+      threshold: 1024,
+      filter: (req: express.Request, res: express.Response) => {
+        // Skip SSE streams — compression would break the chunked event protocol.
+        if (res.getHeader('Content-Type') === 'text/event-stream') {
+          return false;
+        }
+        return compression.filter(req, res);
+      },
+    }),
+  );
   const logger = app.get(WINSTON_MODULE_NEST_PROVIDER);
   app.useLogger(logger);
 
@@ -29,6 +47,9 @@ async function bootstrap() {
   if (!['test', 'ci'].includes(nodeEnv)) {
     assertSecureJwtSecret(config.get<string>('JWT_SECRET'));
   }
+
+  // Refuse to start with an inconsistent mainnet configuration (#498).
+  assertMainnetConfig();
 
   const port = config.get<number>('PORT', 3000);
   const apiPrefix = config.get<string>('API_PREFIX', 'api/v1');

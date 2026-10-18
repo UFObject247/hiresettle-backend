@@ -3,7 +3,7 @@ import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import axios from 'axios';
 import { QUEUE_WEBHOOK } from './queues.module';
-import { WebhookPayload } from '../modules/webhooks/webhooks.service';
+import { WebhookPayload, WEBHOOK_MAX_PAYLOAD_BYTES } from '../modules/webhooks/webhooks.service';
 import { signWebhookBody, WEBHOOK_SIGNATURE_HEADER } from '../modules/webhooks/webhook-signing.util';
 import { PrismaService } from '../common/prisma/prisma.service';
 
@@ -29,7 +29,25 @@ export class WebhookProcessor extends WorkerHost {
     const { url, payload, secret } = job.data;
     this.logger.log(`Delivering webhook job ${job.id} to ${url} (event: ${payload.event}, attempt: ${job.attemptsMade + 1})`);
 
-    const rawBody = JSON.stringify(payload);
+    // Enforce 256 KB payload size limit (#492): replace oversized payloads with a reference URL.
+    let effectivePayload = payload;
+    const rawCheck = JSON.stringify(payload);
+    if (Buffer.byteLength(rawCheck, 'utf8') > WEBHOOK_MAX_PAYLOAD_BYTES) {
+      this.logger.warn(
+        `Webhook job ${job.id} payload exceeds ${WEBHOOK_MAX_PAYLOAD_BYTES} bytes — sending reference URL`,
+      );
+      let origin = '';
+      try { origin = new URL(url).origin; } catch { /* ignore */ }
+      effectivePayload = {
+        event: payload.event,
+        engagementId: payload.engagementId,
+        status: payload.status,
+        timestamp: payload.timestamp,
+        oversized: true,
+        resourceUrl: `${origin}/api/v1/engagements/${payload.engagementId}`,
+      };
+    }
+    const rawBody = JSON.stringify(effectivePayload);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (secret) {
       headers[WEBHOOK_SIGNATURE_HEADER] = signWebhookBody(rawBody, secret);
