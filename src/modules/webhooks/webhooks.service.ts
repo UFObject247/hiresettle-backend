@@ -10,7 +10,14 @@ export interface WebhookPayload {
   engagementId: string;
   status: string;
   timestamp: string;
+  /** Set when the original payload exceeded the size limit and was truncated. */
+  oversized?: true;
+  /** URL where the full resource can be retrieved when the payload was oversized. */
+  resourceUrl?: string;
 }
+
+/** Maximum webhook payload size in bytes (256 KB). */
+export const WEBHOOK_MAX_PAYLOAD_BYTES = 256 * 1024;
 
 export interface WebhookDeliveryMeta {
   userId?: string;
@@ -45,7 +52,8 @@ export class WebhooksService {
     // Fallback: inline delivery when queue is not available
     this.logger.log(`Delivering webhook inline to ${url} (event: ${payload.event})`);
     try {
-      const rawBody = JSON.stringify(payload);
+      const effectivePayload = this.enforcePayloadSizeLimit(payload, url);
+      const rawBody = JSON.stringify(effectivePayload);
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (meta.secret) {
         headers[WEBHOOK_SIGNATURE_HEADER] = signWebhookBody(rawBody, meta.secret);
@@ -84,6 +92,47 @@ export class WebhooksService {
         examplePayload: { event: 'PAYMENT_RELEASED', engagementId: 'eng_123', status: 'ACTIVE', timestamp: '2026-08-29T00:00:00.000Z' },
       },
     ];
+  }
+
+  /**
+   * Enforce the 256 KB payload size limit (#492).
+   *
+   * When the serialised payload exceeds WEBHOOK_MAX_PAYLOAD_BYTES the event
+   * fields are kept but all other data is stripped and replaced with a
+   * `resourceUrl` pointing to the API endpoint where the consumer can fetch
+   * the full resource.  This ensures large payloads never time out at the
+   * receiver while the event still delivers.
+   */
+  enforcePayloadSizeLimit(payload: WebhookPayload, deliveryUrl: string): WebhookPayload {
+    const raw = JSON.stringify(payload);
+    if (Buffer.byteLength(raw, 'utf8') <= WEBHOOK_MAX_PAYLOAD_BYTES) {
+      return payload;
+    }
+
+    this.logger.warn(
+      `Webhook payload for event ${payload.event} on engagement ${payload.engagementId} ` +
+      `exceeds ${WEBHOOK_MAX_PAYLOAD_BYTES} bytes — sending reference URL instead`,
+    );
+
+    // Derive a resource URL from the API base extracted from the delivery target.
+    // Fall back to a relative path when the origin cannot be parsed.
+    let origin = '';
+    try {
+      origin = new URL(deliveryUrl).origin;
+    } catch {
+      // leave empty — consumer must resolve relative URLs against their own base
+    }
+
+    const resourceUrl = `${origin}/api/v1/engagements/${payload.engagementId}`;
+
+    return {
+      event: payload.event,
+      engagementId: payload.engagementId,
+      status: payload.status,
+      timestamp: payload.timestamp,
+      oversized: true,
+      resourceUrl,
+    };
   }
 
   verifyProviderSignature(rawBody: string | Buffer, signatureHeader: string | undefined, secret: string): boolean {
